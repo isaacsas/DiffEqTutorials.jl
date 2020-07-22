@@ -1,0 +1,233 @@
+---
+title: "Catalyst Tutorial I: Introduction"
+author: Samuel Isaacson
+---
+
+[Catalyst.jl](https://github.com/SciML/Catalyst.jl) is a domain specific
+language (DSL) for writing chemical reaction networks in Julia. The generated
+chemical reaction network model can then be translated into a variety of
+mathematical models which can be solved using components of the broader
+[SciML](http://sciml.ai/) ecosystem.
+
+In this tutorial we'll provide an introduction to using Catalyst to specify
+chemical reaction networks, and then to solve ODE, stochastic chemical kinetics
+jump and chemical Langevin SDE models generated from them. Let's start by using
+the Catalyst `@reaction_network` macro to specify a simply chemical reaction
+network; the well-known Repressilator.
+
+We first import the basic packages we'll need, using Plots.jl for making
+figures:
+
+```julia
+# If not already installed, first hit "]" within a Julia REPL. Then type:
+# add DiffEqBase OrdinaryDiffEq StochasticDiffEq DiffEqJump Catalyst PyPlot Plots Latexify
+
+using Catalyst, Plots, Latexify
+pyplot(fmt=:svg);
+```
+
+We now construct the reaction network. The basic types of arrows and predefined
+rate laws one can use are discussed in detail within the [Catalyst
+documentation](https://catalyst.sciml.ai/stable/). Here we use a mix of first
+order, zero order and repressive Hill function rate laws. Note, $\varnothing$
+corresponds to the empty state, and is used for zeroth order production and
+first order degradation reactions:
+
+```julia results="hidden"
+repressilator = @reaction_network begin
+    hillr(P₃,α,K,n), ∅ --> m₁
+    hillr(P₁,α,K,n), ∅ --> m₂
+    hillr(P₂,α,K,n), ∅ --> m₃
+    (δ,γ), m₁ ↔ ∅
+    (δ,γ), m₂ ↔ ∅
+    (δ,γ), m₃ ↔ ∅
+    β, m₁ --> m₁ + P₁
+    β, m₂ --> m₂ + P₂
+    β, m₃ --> m₃ + P₃
+    μ, P₁ --> ∅
+    μ, P₂ --> ∅
+    μ, P₃ --> ∅
+end α K n δ γ β μ;
+```
+
+We can use Latexify to look at the corresponding reactions and understand the
+generated rate laws for each reaction
+
+```julia; eval=false;
+latexify(repressilator)
+```
+```julia; echo=false; skip="notebook";
+mathjax = WEAVE_ARGS[:doctype] == "pdf" ? false : true
+x = latexify(repressilator; mathjax=mathjax);
+display("text/latex", "$x");
+```
+
+## Converting to Mass Action ODES and Solving
+To convert the reaction network to a system of mass action ODEs and solve, we
+need to specify the values of the parameters in the model, the initial
+condition, and the time interval to solve the model on. To do this it helps to
+know the orderings of the parameters and the species. Parameters are ordered in
+the same order they appear after the `end` statement in the `@reaction_network`
+macro. Species are ordered in the order they first appear within the
+`@reaction_network` macro. We can see these orderings using the `speciesmap` and
+`paramsmap` functions:
+
+```julia
+speciesmap(repressilator)
+```
+
+```julia
+paramsmap(repressilator)
+```
+
+Knowing these orderings, we can create parameter and initial condition vectors,
+and setup the `ODEProblem` we want to solve:
+
+```julia
+# import ODE solver packages
+using DiffEqBase, OrdinaryDiffEq
+
+# parameters [α,K,n,δ,γ,β,μ]
+p = (.5, 40, 2, log(2)/120, 5e-3, 20*log(2)/120, log(2)/60)
+
+# initial condition [m₁,m₂,m₃,P₁,P₂,P₃]
+u₀ = [0.,0.,0.,20.,0.,0.]
+
+# time interval to solve on
+tspan = (0., 10000.)
+
+# create the ODEProblem we want to solve
+oprob = ODEProblem(repressilator, u₀, tspan, p)
+```
+
+At this point we are all set to solve the ODEs. We can now use any ODE solver
+from within the
+[OrdinaryDiffEq](https://github.com/SciML/OrdinaryDiffEq.jl/) package.
+We'll use the default recommended solver, `Tsit5` for now, and then plot the
+solutions:
+
+```julia
+sol = solve(oprob, Tsit5(), saveat=10.)
+plot(sol)
+```
+
+We see the well-known oscillatory behavior of the repressilator! For more on
+choices of ODE solvers, see the [SciML
+documentation](https://docs.sciml.ai/dev/solvers/ode_solve).
+
+---
+
+## Stochastic Simulation Algorithms (SSAs) for Stochastic Chemical Kinetics
+Let's now look at a stochastic chemical kinetics model of the repressilator,
+modeling it with jump processes. Here we will construct a
+[DiffEqJump](https://github.com/SciML/DiffEqJump.jl/) `JumpProblem` that uses
+Gillespie's `Direct` method, and then solve it to generate one realization of
+the jump process:
+
+```julia
+# load the DiffEqJump package
+using DiffEqJump
+
+# first we redefine the initial condition to be integer valued
+u₀ = [0,0,0,20,0,0]
+
+# next we create a discrete problem to encode that our species are integer valued:
+dprob = DiscreteProblem(repressilator, u₀, tspan, p)
+
+# now we create a JumpProblem, and specify Gillespie's Direct Method as the solver:
+jprob = JumpProblem(repressilator, dprob, Direct(), save_positions=(false,false))
+
+# now let's solve and plot the jump process:
+sol = solve(jprob, SSAStepper(), saveat=10.)
+plot(sol, fmt=:svg)
+```
+
+Here we see that oscillations remain, but become much noisier. Note, in
+constructing the `JumpProblem` we could have used any of the SSAs that are part
+of DiffEqJump instead of the `Direct` method, see the list of SSAs (i.e.
+constant rate jump aggregators) in the
+[documentation](https://docs.sciml.ai/latest/types/jump_types/#Constant-Rate-Jump-Aggregators-1).
+
+---
+## Chemical Langevin Equation (CLE) Stochastic Differential Equation (SDE) Models:
+At an intermediary physical scale between macroscopic ODE models and microscopic
+stochastic chemical kinetic models lies the CLE, a SDE version of the model. The
+SDEs add to each ODE above a noise term. As the repressilator has species that
+get very close to zero in size, it is not a good candidate to model with the CLE
+(where solutions can then go negative and become unphysical). Let's create a
+simpler reaction network for a birth-death process that will stay non-negative:
+
+```julia
+bdp = @reaction_network begin
+  c₁, X --> 2X
+  c₂, X --> 0
+  c₃, 0 --> X
+end c₁ c₂ c₃
+p = (1.0,2.0,50.)
+u₀ = [5.]
+tspan = (0.,4.);
+```
+
+The corresponding Chemical Langevin Equation SDE is then 
+
+$$
+dX(t) = (c_1 X - c_2 X + c_3) dt + \sqrt{\left| c_1 X \right|} dW_1(t) - \sqrt{\left| c_2 X \right|} dW_2(t)
++ \sqrt{c_3} dW_3(t)
+$$
+where each $W_i(t)$ denotes an independent Brownian Motion. 
+
+<!-- 
+```julia; results="hidden";
+latexify(bdp, noise=true, cdot=false)
+```
+```julia; echo=false; skip="notebook";
+x = latexify(bdp, noise=true, cdot=false, starred=true);
+display("text/latex", "$x");
+```
+-->
+
+We can solve the CLE SDE model by creating an `SDEProblem` and specifying a
+solver from the [StochasticDiffEq](https://github.com/SciML/StochasticDiffEq.jl)
+package:
+
+```julia
+# import the SDE solvers
+using StochasticDiffEq
+
+# SDEProblem for CLE
+sprob = SDEProblem(bdp, u₀, tspan, p)
+
+# solve and plot, tstops is used to specify enough points
+# that the plot looks well-resolved
+sol = solve(sprob, LambaEulerHeun(), tstops=range(0., step=4e-3, length=1001))
+plot(sol, fmt=:svg)
+```
+
+We again have complete freedom to select any of the
+StochasticDiffEq.jl SDE solvers, see the
+[documentation](https://docs.sciml.ai/dev/solvers/sde_solve).
+
+---
+The [Catalyst API
+documentation](https://catalyst.sciml.ai/stable/api/catalyst_api/) provides a
+thorough description of the many API functions that are provided to access
+network properties, and work with generated `ReactionSystem`s. 
+
+<!-- In Catalyst Tutorial II we'll explore the API. -->
+
+---
+## Getting Help
+Have a question related to Catalyst or this tutorial? Feel free to ask in the
+SciML [Gitter](https://gitter.im/JuliaDiffEq/Lobby). If you think you've found a
+bug in Catalyst, or would like to request/discuss new functionality, feel free
+to open an issue on [Github](https://github.com/SciML/Catalyst.jl) (but
+please check there is no related issue already open). If you've found a bug in
+this tutorial, or have a suggestion, feel free to open an issue on the
+[SciMLTutorials Github site](https://github.com/SciML/SciMLTutorials.jl).
+Or, submit a pull request to SciMLTutorials updating the tutorial!
+
+---
+```julia; echo=false; skip="notebook"
+using SciMLTutorials
+SciMLTutorials.tutorial_footer(WEAVE_ARGS[:folder],WEAVE_ARGS[:file], remove_homedir=true)
+```
